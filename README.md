@@ -1,80 +1,20 @@
-export MY_SG_NAME="student13-web-sg"
+aws sts get-caller-identity --profile student13
 
-export MY_SG_ID=$(aws ec2 describe-security-groups \
-  --filters \
-    "Name=group-name,Values=$MY_SG_NAME" \
-    "Name=vpc-id,Values=$VPC_ID" \
-  --query "SecurityGroups[0].GroupId" \
-  --output text)
+# 세션 갱신 및 환경변수 고정
+aws sso login --profile student13
+export AWS_PROFILE="student13"
+export AWS_REGION="ap-northeast-2"
+export AWS_PAGER=""
+# aws sts get-caller-identity
+aws ec2 describe-availability-zones \
+--filters "Name=state,Values=available" \
+--query "AvailabilityZones[].{Zone:ZoneName,State:State}" \
+--output table
 
-if [ "$MY_SG_ID" = "None" ] || [ -z "$MY_SG_ID" ]; then
-  export MY_SG_ID=$(aws ec2 create-security-group \
-    --group-name "$MY_SG_NAME" \
-    --description "Security Group for Spring Boot and Nginx Practice" \
-    --vpc-id "$VPC_ID" \
-    --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=$MY_SG_NAME},{Key=Course,Value=infra-training}]" \
-    --query "GroupId" \
-    --output text)
-fi
-
-echo "보안 그룹 ID: $MY_SG_ID"
-
-
-
-export MY_KEY_NAME="student13-key-v2"
-KEY_FILE="./$MY_KEY_NAME.pem"
-
-if aws ec2 describe-key-pairs --key-names "$MY_KEY_NAME" >/dev/null 2>&1; then
-  if [ -s "$KEY_FILE" ]; then
-    echo "기존 키 페어와 로컬 PEM 파일을 사용합니다: $KEY_FILE"
-  else
-    echo "AWS에는 '$MY_KEY_NAME' 키가 있지만 사용할 수 있는 $KEY_FILE 파일이 없습니다." >&2
-    echo "기존 개인 키는 다시 내려받을 수 없으므로 새 키 이름으로 생성해야 합니다." >&2
-  fi
-else
-  if [ -e "$KEY_FILE" ]; then
-    echo "기존 로컬 파일을 덮어쓰지 않았습니다: $KEY_FILE" >&2
-    echo "MY_KEY_NAME을 새 이름으로 바꾼 뒤 다시 실행하세요." >&2
-  else
-    if aws ec2 create-key-pair \
-      --key-name "$MY_KEY_NAME" \
-      --query "KeyMaterial" \
-      --output text > "$KEY_FILE"; then
-      chmod 400 "$KEY_FILE"
-      echo "키 페어 생성 완료: $KEY_FILE"
-    else
-      rm -f "$KEY_FILE"
-      echo "키 페어 생성에 실패했습니다." >&2
-    fi
-  fi
-fi
-
-ls -l "$KEY_FILE"
-
-
-if AMI_ID=$(aws ec2 describe-images \
-  --owners 099720109477 \
-  --filters \
-    "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*" \
-    "Name=state,Values=available" \
-  --query "sort_by(Images,&CreationDate)[-1].ImageId" \
-  --output text) && [ -n "$AMI_ID" ] && [ "$AMI_ID" != "None" ]; then
-  export AMI_ID
-  echo "최신 Ubuntu 24.04 ARM64 AMI: $AMI_ID"
-else
-  unset AMI_ID
-  echo "Ubuntu 24.04 ARM64 AMI를 조회하지 못했습니다. AWS 리전을 확인하세요." >&2
-fi
-
-
-export MY_KEY_NAME="student13-key-3"
-
-aws ec2 create-key-pair \
---key-name "$MY_KEY_NAME" \
---query "KeyMaterial" \
---output text > ./"$MY_KEY_NAME".pem
-
-ls -l *.pem
+export VPC_ID=$(aws ec2 describe-vpcs \
+--filters "Name=is-default,Values=true" \
+--query "Vpcs[0].VpcId" --output text)
+echo "기본 VPC ID:$VPC_ID"
 
 export MY_SG_NAME="student13-web-sg"
 export MY_SG_ID=$(aws ec2 create-security-group \
@@ -84,3 +24,65 @@ export MY_SG_ID=$(aws ec2 create-security-group \
 --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=$MY_SG_NAME},{Key=Course,Value=infra-training}]" \
 --query "GroupId" --output text)
 echo "생성된 보안 그룹 ID:$MY_SG_ID"
+
+# 1. 내 공인 IP 자동 감지
+export MY_IP=$(curl -fsS https://checkip.amazonaws.com)
+echo "내 공인 IP:$MY_IP"
+
+# 2. SSH는 내 IP만, 웹 포트는 전역 허용
+aws ec2 authorize-security-group-ingress --group-id "$MY_SG_ID" --protocol tcp --port 22 --cidr "$MY_IP/32"
+aws ec2 authorize-security-group-ingress --group-id "$MY_SG_ID" --protocol tcp --port 80 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --group-id "$MY_SG_ID" --protocol tcp --port 8080 --cidr 0.0.0.0/0
+
+# 3. 등록 결과 확인
+aws ec2 describe-security-groups --group-ids "$MY_SG_ID" \
+--query "SecurityGroups[0].IpPermissions[].{Port:FromPort,Proto:IpProtocol,Cidr:IpRanges[0].CidrIp}" \
+--output table
+
+export MY_KEY_NAME="student13-key"
+
+aws ec2 create-key-pair \
+--key-name "$MY_KEY_NAME" \
+--query "KeyMaterial" \
+--output text > ./"$MY_KEY_NAME".pem
+
+ls -l *.pem
+chmod 400 *.pem
+ls -l *.pem
+
+# 1. 서울 리전 최신 Ubuntu 26.04 ARM AMI 조회
+export AMI_ID=$(aws ssm get-parameter \
+--name /aws/service/canonical/ubuntu/server/26.04/stable/current/arm64/hvm/ebs-gp3/ami-id \
+--query "Parameter.Value" --output text)
+echo "최신 Ubuntu ARM AMI:$AMI_ID"
+# 2. 인스턴스 프로비저닝
+export INSTANCE_ID=$(aws ec2 run-instances \
+--image-id "$AMI_ID" \
+--instance-type t4g.nano \
+--key-name "$MY_KEY_NAME" \
+--security-group-ids "$MY_SG_ID" \
+--tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=student01-test-ec2},{Key=Course,Value=infra-training}]" \
+--query "Instances[0].InstanceId" --output text)
+echo "프로비저닝 인스턴스 ID:$INSTANCE_ID"
+# 3. 상태 대기 (임의의 sleep 대신 공식 waiter 사용)
+aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+# 4. 공인 IP 조회
+export PUBLIC_IP=$(aws ec2 describe-instances \
+--instance-ids "$INSTANCE_ID" \
+--query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+echo "할당된 퍼블릭 IP:$PUBLIC_IP"
+
+ssh -i "$MY_KEY_NAME".pem -o StrictHostKeyChecking=accept-new ubuntu@"$PUBLIC_IP"
+uname -m                                  # 출력: aarch64
+grep PRETTY_NAME /etc/os-release          # 출력: Ubuntu 26.04.1 LTS
+free -h | head -2                         # t4g.nano 메모리 약 405Mi
+```bash
+exit
+```
+
+```bash
+aws ec2 stop-instances --instance-ids "$INSTANCE_ID"
+aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+echo "인스턴스가 안전하게 중지(Stopped)되었습니다."
+```
